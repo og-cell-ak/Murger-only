@@ -44,6 +44,6 @@ private class Merger(private val c:Context){
  private fun extract(s:String)=MediaExtractor().also{it.setDataSource(c,Uri.parse(s),null)}
  private fun find(e:MediaExtractor,p:String):Int{for(i in 0 until e.trackCount)if(e.getTrackFormat(i).getString(MediaFormat.KEY_MIME)?.startsWith(p)==true)return i;return -1}
  private fun duration(e:MediaExtractor,t:Int)=if(e.getTrackFormat(t).containsKey(MediaFormat.KEY_DURATION))e.getTrackFormat(t).getLong(MediaFormat.KEY_DURATION)else 0L
- private fun compatible(a:MediaFormat,b:MediaFormat):Boolean{val k=listOf(MediaFormat.KEY_MIME,MediaFormat.KEY_WIDTH,MediaFormat.KEY_HEIGHT,MediaFormat.KEY_SAMPLE_RATE,MediaFormat.KEY_CHANNEL_COUNT);return k.all{if(a.containsKey(it)&&b.containsKey(it))a.getValue(it)==b.getValue(it)else true}}
+ private fun compatible(a:MediaFormat,b:MediaFormat):Boolean{if(a.getString(MediaFormat.KEY_MIME)!=b.getString(MediaFormat.KEY_MIME))return false;val k=listOf(MediaFormat.KEY_WIDTH,MediaFormat.KEY_HEIGHT,MediaFormat.KEY_SAMPLE_RATE,MediaFormat.KEY_CHANNEL_COUNT);return k.all{if(a.containsKey(it)&&b.containsKey(it))a.getInteger(it)==b.getInteger(it)else true}}
  private fun copy(e:MediaExtractor,t:Int,dst:Int,m:MediaMuxer,off:Long){e.selectTrack(t);val b=ByteBuffer.allocateDirect(2*1024*1024);val info=MediaCodec.BufferInfo();while(true){b.clear();val n=e.readSampleData(b,0);if(n<0)break;info.offset=0;info.size=n;info.presentationTimeUs=e.sampleTime+off;info.flags=e.sampleFlags;m.writeSampleData(dst,b,info);e.advance()};e.unselectTrack(t)}
 }
