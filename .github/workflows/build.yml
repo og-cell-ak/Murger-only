@@ -1,5 +1,8 @@
 name: Build Murger Only APK
-on: {workflow_dispatch: {}}
+on:
+ push:
+  branches: [main]
+ workflow_dispatch:
 permissions: {contents: read}
 jobs:
  build:
