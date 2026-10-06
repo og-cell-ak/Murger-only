@@ -32,13 +32,13 @@ private class Merger(private val c:Context){
   var pfd:ParcelFileDescriptor?=null
   try{
    pfd=c.contentResolver.openFileDescriptor(uri,"w")?:error("Could not open output file")
-   val mux=MediaMuxer(pfd.fileDescriptor,MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);val ov=mux.addTrack(vf);val oa=if(af!=null)mux.addTrack(af)else -1;mux.start();pfd.close();pfd=null
+   val mux=MediaMuxer(pfd.fileDescriptor,MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);val ov=mux.addTrack(vf);val oa=if(af!=null)mux.addTrack(af)else -1;mux.start()
    var vo=0L;var ao=0L
    for((idx,s) in items.withIndex()){
     val e=extract(s);val iv=find(e,"video/");val ia=find(e,"audio/");require(iv>=0){"Video "+(idx+1)+" has no video track"};require(compatible(vf,e.getTrackFormat(iv))){"Video "+(idx+1)+" has a different video format. Use matching codec/resolution/settings."};if(af!=null)require(ia>=0&&compatible(af,e.getTrackFormat(ia))){"Video "+(idx+1)+" has a different audio format."}
     progress((idx*100)/items.size,"Merging video "+(idx+1)+"/"+items.size);val vd=duration(e,iv);copy(e,iv,ov,mux,vo);if(oa>=0&&ia>=0){val ad=duration(e,ia);copy(e,ia,oa,mux,ao);ao+=ad};vo+=vd;e.release();progress(((idx+1)*100)/items.size,"Merging video "+(idx+1)+"/"+items.size)
    }
-   mux.stop();mux.release();if(Build.VERSION.SDK_INT>=29)c.contentResolver.update(uri,ContentValues().apply{put(MediaStore.Video.Media.IS_PENDING,0)},null,null)
+   mux.stop();mux.release();pfd?.close();pfd=null;if(Build.VERSION.SDK_INT>=29)c.contentResolver.update(uri,ContentValues().apply{put(MediaStore.Video.Media.IS_PENDING,0)},null,null)
   }catch(t:Throwable){c.contentResolver.delete(uri,null,null);throw t}finally{pfd?.close();first.release()}
  }
  private fun extract(s:String)=MediaExtractor().also{it.setDataSource(c,Uri.parse(s),null)}
