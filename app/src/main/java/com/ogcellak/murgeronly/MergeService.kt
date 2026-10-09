@@ -85,36 +85,76 @@ private class Merger(private val context: Context) {
     private data class Clip(val uri: String, val videoTrack: Int, val audioTrack: Int,
         val videoFormat: MediaFormat, val audioFormat: MediaFormat?, val videoDuration: Long, val audioDuration: Long)
 
-    fun run(items: ArrayList<String>, progress: (Int, String) -> Unit) {
+    suspend fun run(items: ArrayList<String>, progress: (Int, String) -> Unit) {
         require(items.size >= 2) { "Select at least two videos." }
-        progress(1, "Checking formats before creating output…")
-        val clips = ArrayList<Clip>()
-        for ((index, item) in items.withIndex()) {
+        val mediaItems = items.mapIndexed { index, item ->
+            progress((index * 3).coerceAtMost(12), "Checking video ${index + 1}/${items.size}…")
             val extractor = open(item)
             try {
-                val video = find(extractor, "video/")
-                val audio = find(extractor, "audio/")
-                require(video >= 0) { "Video ${index + 1} has no readable video track." }
-                val vf = extractor.getTrackFormat(video)
-                val af = if (audio >= 0) extractor.getTrackFormat(audio) else null
-                if (clips.isNotEmpty()) {
-                    require(compatible(clips[0].videoFormat, vf)) {
-                        "Video ${index + 1} is not compatible for lossless merging. " +
-                            "First: ${describe(clips[0].videoFormat)}; this clip: ${describe(vf)}. " +
-                            "No video was changed. Clips with different codecs or resolutions need conversion, which would re-encode."
-                    }
-                    val firstAudio = clips[0].audioFormat
-                    require((firstAudio == null && af == null) || (firstAudio != null && af != null && compatible(firstAudio, af))) {
-                        "Video ${index + 1} has incompatible audio tracks. " +
-                            "First: ${firstAudio?.let { describe(it) } ?: "no audio"}; this clip: ${af?.let { describe(it) } ?: "no audio"}. No output was created."
+                require(find(extractor, "video/") >= 0) {
+                    "File ${index + 1} has no readable video track. WAV is audio-only and cannot be used as a video clip."
+                }
+            } finally { extractor.release() }
+            EditedMediaItem.Builder(MediaItem.fromUri(Uri.parse(item))).build()
+        }
+        val composition = Composition.Builder(EditedMediaItemSequence.Builder(mediaItems).build()).build()
+        val temp = java.io.File(context.cacheDir, "merged_${System.currentTimeMillis()}.mp4")
+        progress(3, "Converting clips to a common MP4 format…")
+        try {
+            suspendCancellableCoroutine<Unit> { continuation ->
+                val transformer = Transformer.Builder(context)
+                    .setVideoMimeType(MimeTypes.VIDEO_H264)
+                    .setAudioMimeType(MimeTypes.AUDIO_AAC)
+                    .addListener(object : Transformer.Listener {
+                        override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                            if (continuation.isActive) continuation.resume(Unit)
+                        }
+                        override fun onError(composition: Composition, exportResult: ExportResult, exportException: ExportException) {
+                            if (continuation.isActive) continuation.resumeWith(Result.failure(
+                                IllegalStateException("Conversion failed: ${exportException.message ?: "unsupported or damaged clip"}")))
+                        }
+                    }).build()
+                continuation.invokeOnCancellation { try { transformer.cancel() } catch (_: Exception) {} }
+                transformer.start(composition, temp.absolutePath)
+                CoroutineScope(Dispatchers.IO).launch {
+                    val holder = ProgressHolder()
+                    while (continuation.isActive) {
+                        try {
+                            if (transformer.getProgress(holder) == Transformer.PROGRESS_STATE_AVAILABLE) {
+                                progress((5 + holder.progress * 90 / 100).coerceIn(5, 95),
+                                    "Converting clips to MP4 • ${holder.progress}%")
+                            }
+                        } catch (_: Exception) {}
+                        delay(500)
                     }
                 }
-                clips.add(Clip(item, video, audio, vf, af, duration(extractor, video),
-                    if (audio >= 0) duration(extractor, audio) else 0L))
-            } finally { extractor.release() }
-        }
-        require(clips.sumOf { it.videoDuration } > 0L) { "Could not read video durations. Try standard MP4 files with timestamps." }
-        mergeValidated(clips, progress)
+            }
+            require(temp.exists() && temp.length() > 0L) { "Conversion finished without an output file." }
+            progress(97, "Saving merged MP4…")
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, "MergerOnly_${System.currentTimeMillis()}.mp4")
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                if (Build.VERSION.SDK_INT >= 29) {
+                    put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Merger Only")
+                    put(MediaStore.Video.Media.IS_PENDING, 1)
+                }
+            }
+            val output = context.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                ?: error("Android could not create output. Check available storage.")
+            var saved = false
+            try {
+                context.contentResolver.openOutputStream(output, "w").use { stream ->
+                    requireNotNull(stream) { "Could not open output file." }
+                    temp.inputStream().use { input -> input.copyTo(stream, 1024 * 1024) }
+                }
+                if (Build.VERSION.SDK_INT >= 29) context.contentResolver.update(output,
+                    ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null)
+                saved = true
+            } finally {
+                if (!saved) try { context.contentResolver.delete(output, null, null) } catch (_: Exception) {}
+            }
+            progress(100, "Merge complete. Saved in Movies/Merger Only")
+        } finally { try { temp.delete() } catch (_: Exception) {} }
     }
 
     private fun mergeValidated(clips: List<Clip>, progress: (Int, String) -> Unit) {
