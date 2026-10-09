@@ -86,12 +86,12 @@ class MainActivity : Activity() {
         root.addView(hero)
 
         root.addView(TextView(this).apply {
-            text = "LOSSLESS STREAM COPY"
+            text = "MIXED-FORMAT MP4 EXPORT"
             textSize = 12f; setTypeface(Typeface.DEFAULT, Typeface.BOLD)
             setTextColor(Color.rgb(100, 211, 190)); setPadding(dp(2), dp(20), 0, dp(5))
         })
         root.addView(TextView(this).apply {
-            text = "No re-encoding means no extra quality loss. For reliable merging, all clips must use compatible video and audio formats."
+            text = "Different supported video formats are converted to a common H.264/AAC MP4 before joining. Conversion can change quality slightly; keep enough free storage for the export."
             textSize = 14f; setTextColor(Color.rgb(211, 220, 237)); setPadding(dp(2), 0, dp(2), dp(14))
         })
 
@@ -201,8 +201,12 @@ class MainActivity : Activity() {
         val elapsed = max(1L, (System.currentTimeMillis() - start) / 1000L)
         eta.text = when {
             p >= 100 -> "Finished"
+            message.startsWith("Merge failed:") -> "Ready to retry"
             p <= 0 || start <= 0L -> "Estimating time…"
             else -> "About ${formatTime((elapsed.toDouble() * (100 - p) / max(1, p)).toLong())} left"
+        }
+        if (p >= 100 || message.startsWith("Merge failed:")) {
+            merge.isEnabled = names.size >= 2
         }
     }
 
