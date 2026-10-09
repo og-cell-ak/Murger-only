@@ -1,4 +1,5 @@
 package com.ogcellak.murgeronly
+
 import android.app.*
 import android.content.*
 import android.media.*
@@ -8,42 +9,216 @@ import android.provider.MediaStore
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
 import java.nio.ByteBuffer
+import kotlin.math.max
 
-class MergeService:Service(){
- companion object{const val START="START";private const val CH="merge";private const val ID=7001}
- private val scope=CoroutineScope(SupervisorJob()+Dispatchers.IO)
- override fun onCreate(){super.onCreate();if(Build.VERSION.SDK_INT>=26)getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel(CH,"Video merging",NotificationManager.IMPORTANCE_LOW))}
- override fun onStartCommand(i:Intent?,flags:Int,startId:Int):Int{
-  if(i?.action==START){startForeground(ID,notice("Preparing merge...",0));val uris=i.getStringArrayListExtra("uris")?:arrayListOf()
-   scope.launch{try{Merger(this@MergeService).run(uris){p,s->notifyState(p,s)};notifyState(100,"Merge complete. Saved in Movies/Murger");delay(1800)}catch(t:Throwable){notifyState(0,"Merge failed: "+(t.message?:"unsupported video"));delay(3500)}finally{stopForeground(STOP_FOREGROUND_REMOVE);stopSelf(startId)}}}
-  return START_NOT_STICKY
- }
- private fun notice(t:String,p:Int)=NotificationCompat.Builder(this,CH).setSmallIcon(android.R.drawable.stat_sys_upload).setContentTitle("Murger Only").setContentText(t).setOngoing(p<100).setProgress(100,p.coerceIn(0,100),false).build()
- private fun notifyState(p:Int,t:String){getSystemService(NotificationManager::class.java).notify(ID,notice(t,p))}
- override fun onDestroy(){scope.cancel();super.onDestroy()};override fun onBind(i:Intent?)=null
+class MergeService : Service() {
+    companion object {
+        const val START = "START"
+        const val PROGRESS = "com.ogcellak.murgeronly.MERGE_PROGRESS"
+        private const val CHANNEL = "merge"
+        private const val NOTIFICATION_ID = 7001
+    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    override fun onCreate() {
+        super.onCreate()
+        if (Build.VERSION.SDK_INT >= 26) getSystemService(NotificationManager::class.java)
+            .createNotificationChannel(NotificationChannel(CHANNEL, "Video merging", NotificationManager.IMPORTANCE_LOW))
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == START) {
+            startForeground(NOTIFICATION_ID, notice("Checking videos…", 0))
+            val uris = intent.getStringArrayListExtra("uris") ?: arrayListOf()
+            getSharedPreferences("merge_state", MODE_PRIVATE).edit()
+                .putBoolean("running", true).putInt("progress", 0)
+                .putLong("started", System.currentTimeMillis()).putString("message", "Checking videos…").apply()
+            scope.launch {
+                try {
+                    Merger(this@MergeService).run(uris) { p, message -> notifyState(p, message) }
+                } catch (t: Throwable) {
+                    notifyState(0, "Merge failed: " + (t.message ?: t.javaClass.simpleName).take(180), false)
+                } finally {
+                    delay(2200)
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf(startId)
+                }
+            }
+        }
+        return START_NOT_STICKY
+    }
+
+    private fun notice(message: String, progress: Int) = NotificationCompat.Builder(this, CHANNEL)
+        .setSmallIcon(android.R.drawable.stat_sys_upload)
+        .setContentTitle("Merger Only")
+        .setContentText(message)
+        .setOngoing(progress in 0..99)
+        .setOnlyAlertOnce(true)
+        .setProgress(100, progress.coerceIn(0, 100), false)
+        .build()
+
+    private fun notifyState(progress: Int, message: String, running: Boolean = progress < 100) {
+        val p = progress.coerceIn(0, 100)
+        getSharedPreferences("merge_state", MODE_PRIVATE).edit()
+            .putBoolean("running", running).putInt("progress", p)
+            .putString("message", message).apply()
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notice(message, p))
+        sendBroadcast(Intent(PROGRESS).setPackage(packageName).putExtra("progress", p).putExtra("message", message))
+    }
+
+    override fun onDestroy() { scope.cancel(); super.onDestroy() }
+    override fun onBind(intent: Intent?) = null
 }
-private class Merger(private val c:Context){
- fun run(items:ArrayList<String>,progress:(Int,String)->Unit){
-  require(items.size>=2){"Select at least two videos"}
-  val first=extract(items[0]);val vt=find(first,"video/");val at=find(first,"audio/");require(vt>=0){"First video has no video track"}
-  val vf=first.getTrackFormat(vt);val af=if(at>=0)first.getTrackFormat(at)else null
-  val cv=ContentValues().apply{put(MediaStore.Video.Media.DISPLAY_NAME,"merged_"+System.currentTimeMillis()+".mp4");put(MediaStore.Video.Media.MIME_TYPE,"video/mp4");if(Build.VERSION.SDK_INT>=29)put(MediaStore.Video.Media.RELATIVE_PATH,"Movies/Murger");if(Build.VERSION.SDK_INT>=29)put(MediaStore.Video.Media.IS_PENDING,1)}
-  val uri=c.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI,cv)?:error("Could not create output file")
-  var pfd:ParcelFileDescriptor?=null
-  try{
-   pfd=c.contentResolver.openFileDescriptor(uri,"w")?:error("Could not open output file")
-   val mux=MediaMuxer(pfd.fileDescriptor,MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);val ov=mux.addTrack(vf);val oa=if(af!=null)mux.addTrack(af)else -1;mux.start()
-   var vo=0L;var ao=0L
-   for((idx,s) in items.withIndex()){
-    val e=extract(s);val iv=find(e,"video/");val ia=find(e,"audio/");require(iv>=0){"Video "+(idx+1)+" has no video track"};require(compatible(vf,e.getTrackFormat(iv))){"Video "+(idx+1)+" has a different video format. Use matching codec/resolution/settings."};if(af!=null)require(ia>=0&&compatible(af,e.getTrackFormat(ia))){"Video "+(idx+1)+" has a different audio format."}
-    progress((idx*100)/items.size,"Merging video "+(idx+1)+"/"+items.size);val vd=duration(e,iv);copy(e,iv,ov,mux,vo);if(oa>=0&&ia>=0){val ad=duration(e,ia);copy(e,ia,oa,mux,ao);ao+=ad};vo+=vd;e.release();progress(((idx+1)*100)/items.size,"Merging video "+(idx+1)+"/"+items.size)
-   }
-   mux.stop();mux.release();pfd?.close();pfd=null;if(Build.VERSION.SDK_INT>=29)c.contentResolver.update(uri,ContentValues().apply{put(MediaStore.Video.Media.IS_PENDING,0)},null,null)
-  }catch(t:Throwable){c.contentResolver.delete(uri,null,null);throw t}finally{pfd?.close();first.release()}
- }
- private fun extract(s:String)=MediaExtractor().also{it.setDataSource(c,Uri.parse(s),null)}
- private fun find(e:MediaExtractor,p:String):Int{for(i in 0 until e.trackCount)if(e.getTrackFormat(i).getString(MediaFormat.KEY_MIME)?.startsWith(p)==true)return i;return -1}
- private fun duration(e:MediaExtractor,t:Int)=if(e.getTrackFormat(t).containsKey(MediaFormat.KEY_DURATION))e.getTrackFormat(t).getLong(MediaFormat.KEY_DURATION)else 0L
- private fun compatible(a:MediaFormat,b:MediaFormat):Boolean{if(a.getString(MediaFormat.KEY_MIME)!=b.getString(MediaFormat.KEY_MIME))return false;val k=listOf(MediaFormat.KEY_WIDTH,MediaFormat.KEY_HEIGHT,MediaFormat.KEY_SAMPLE_RATE,MediaFormat.KEY_CHANNEL_COUNT);return k.all{if(a.containsKey(it)&&b.containsKey(it))a.getInteger(it)==b.getInteger(it)else true}}
- private fun copy(e:MediaExtractor,t:Int,dst:Int,m:MediaMuxer,off:Long){e.selectTrack(t);val b=ByteBuffer.allocateDirect(2*1024*1024);val info=MediaCodec.BufferInfo();while(true){b.clear();val n=e.readSampleData(b,0);if(n<0)break;info.offset=0;info.size=n;info.presentationTimeUs=e.sampleTime+off;info.flags=e.sampleFlags;m.writeSampleData(dst,b,info);e.advance()};e.unselectTrack(t)}
+
+private class Merger(private val context: Context) {
+    private data class Clip(val uri: String, val videoTrack: Int, val audioTrack: Int,
+        val videoFormat: MediaFormat, val audioFormat: MediaFormat?, val videoDuration: Long, val audioDuration: Long)
+
+    fun run(items: ArrayList<String>, progress: (Int, String) -> Unit) {
+        require(items.size >= 2) { "Select at least two videos." }
+        progress(1, "Checking formats before creating output…")
+        val clips = ArrayList<Clip>()
+        for ((index, item) in items.withIndex()) {
+            val extractor = open(item)
+            try {
+                val video = find(extractor, "video/")
+                val audio = find(extractor, "audio/")
+                require(video >= 0) { "Video ${index + 1} has no readable video track." }
+                val vf = extractor.getTrackFormat(video)
+                val af = if (audio >= 0) extractor.getTrackFormat(audio) else null
+                if (clips.isNotEmpty()) {
+                    require(compatible(clips[0].videoFormat, vf)) {
+                        "Video ${index + 1} uses a different video format. Lossless merge needs matching codec, resolution and settings."
+                    }
+                    val firstAudio = clips[0].audioFormat
+                    require((firstAudio == null && af == null) || (firstAudio != null && af != null && compatible(firstAudio, af))) {
+                        "Video ${index + 1} uses a different audio format. No output was created."
+                    }
+                }
+                clips.add(Clip(item, video, audio, vf, af, duration(extractor, video),
+                    if (audio >= 0) duration(extractor, audio) else 0L))
+            } finally { extractor.release() }
+        }
+        require(clips.sumOf { it.videoDuration } > 0L) { "Could not read video durations. Try standard MP4 files with timestamps." }
+        mergeValidated(clips, progress)
+    }
+
+    private fun mergeValidated(clips: List<Clip>, progress: (Int, String) -> Unit) {
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, "MergerOnly_${System.currentTimeMillis()}.mp4")
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            if (Build.VERSION.SDK_INT >= 29) {
+                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Merger Only")
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+            }
+        }
+        val output = context.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+            ?: error("Android could not create the output file. Check free storage space.")
+        var pfd: ParcelFileDescriptor? = null
+        var muxer: MediaMuxer? = null
+        var muxerStarted = false
+        var finished = false
+        try {
+            pfd = context.contentResolver.openFileDescriptor(output, "w")
+                ?: error("Could not open output file. Check free storage space and permissions.")
+            muxer = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val outVideo = muxer.addTrack(clips[0].videoFormat)
+            val outAudio = clips[0].audioFormat?.let { muxer.addTrack(it) } ?: -1
+            muxer.start()
+            muxerStarted = true
+
+            val totalVideo = clips.sumOf { it.videoDuration }.coerceAtLeast(1L)
+            val totalAudio = clips.sumOf { it.audioDuration }.coerceAtLeast(1L)
+            var completedVideo = 0L
+            var completedAudio = 0L
+            var videoOffset = 0L
+            var audioOffset = 0L
+            for ((index, clip) in clips.withIndex()) {
+                val extractor = open(clip.uri)
+                try {
+                    val label = "Copying video ${index + 1}/${clips.size}"
+                    copyTrack(extractor, clip.videoTrack, outVideo, muxer, videoOffset, 8 * 1024 * 1024) { sampleTime ->
+                        val local = sampleTime.coerceIn(0L, clip.videoDuration.coerceAtLeast(1L))
+                        val overall = ((completedVideo + local).toDouble() / totalVideo * 85.0).toInt().coerceIn(1, 85)
+                        progress(overall, "$label • original quality")
+                    }
+                    if (outAudio >= 0 && clip.audioTrack >= 0) {
+                        val audioExtractor = open(clip.uri)
+                        try {
+                            copyTrack(audioExtractor, clip.audioTrack, outAudio, muxer, audioOffset, 2 * 1024 * 1024) { sampleTime ->
+                                val local = sampleTime.coerceIn(0L, clip.audioDuration.coerceAtLeast(1L))
+                                val overall = (85.0 + (completedAudio + local).toDouble() / totalAudio * 14.0).toInt().coerceIn(85, 99)
+                                progress(overall, "Copying audio ${index + 1}/${clips.size}")
+                            }
+                        } finally { audioExtractor.release() }
+                        audioOffset += clip.audioDuration
+                        completedAudio += clip.audioDuration
+                    }
+                    videoOffset += clip.videoDuration
+                    completedVideo += clip.videoDuration
+                } finally { extractor.release() }
+            }
+            progress(99, "Finalizing MP4…")
+            muxer.stop()
+            muxerStarted = false
+            muxer.release()
+            muxer = null
+            pfd.close()
+            pfd = null
+            if (Build.VERSION.SDK_INT >= 29) context.contentResolver.update(output,
+                ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null)
+            finished = true
+            progress(100, "Merge complete. Saved in Movies/Merger Only")
+        } finally {
+            if (muxerStarted) try { muxer?.stop() } catch (_: Exception) { }
+            try { muxer?.release() } catch (_: Exception) { }
+            try { pfd?.close() } catch (_: Exception) { }
+            if (!finished) try { context.contentResolver.delete(output, null, null) } catch (_: Exception) { }
+        }
+    }
+
+    private fun open(uri: String) = MediaExtractor().also { it.setDataSource(context, Uri.parse(uri), null) }
+    private fun find(extractor: MediaExtractor, prefix: String): Int {
+        for (i in 0 until extractor.trackCount) {
+            if (extractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME)?.startsWith(prefix) == true) return i
+        }
+        return -1
+    }
+    private fun duration(extractor: MediaExtractor, track: Int): Long {
+        val format = extractor.getTrackFormat(track)
+        return if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION).coerceAtLeast(0L) else 0L
+    }
+    private fun compatible(a: MediaFormat, b: MediaFormat): Boolean {
+        if (a.getString(MediaFormat.KEY_MIME) != b.getString(MediaFormat.KEY_MIME)) return false
+        val keys = listOf(MediaFormat.KEY_WIDTH, MediaFormat.KEY_HEIGHT, MediaFormat.KEY_SAMPLE_RATE,
+            MediaFormat.KEY_CHANNEL_COUNT, MediaFormat.KEY_FRAME_RATE, MediaFormat.KEY_PROFILE, MediaFormat.KEY_LEVEL)
+        return keys.all { key ->
+            !a.containsKey(key) || !b.containsKey(key) || try { a.getInteger(key) == b.getInteger(key) } catch (_: Exception) { true }
+        }
+    }
+    private fun copyTrack(extractor: MediaExtractor, track: Int, destinationTrack: Int, muxer: MediaMuxer,
+        offsetUs: Long, initialBufferSize: Int, onSample: (Long) -> Unit) {
+        extractor.selectTrack(track)
+        val format = extractor.getTrackFormat(track)
+        val suggested = if (format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
+            try { format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE).coerceAtLeast(initialBufferSize) } catch (_: Exception) { initialBufferSize }
+        } else initialBufferSize
+        val buffer = ByteBuffer.allocateDirect(max(initialBufferSize, suggested))
+        val info = MediaCodec.BufferInfo()
+        try {
+            while (true) {
+                buffer.clear()
+                val size = extractor.readSampleData(buffer, 0)
+                if (size < 0) break
+                info.offset = 0
+                info.size = size
+                val sampleTime = extractor.sampleTime.coerceAtLeast(0L)
+                info.presentationTimeUs = sampleTime + offsetUs
+                info.flags = extractor.sampleFlags
+                muxer.writeSampleData(destinationTrack, buffer, info)
+                onSample(sampleTime)
+                extractor.advance()
+            }
+        } finally { extractor.unselectTrack(track) }
+    }
 }
