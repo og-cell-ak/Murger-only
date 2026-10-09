@@ -190,8 +190,11 @@ private class Merger(private val context: Context) {
     }
     private fun compatible(a: MediaFormat, b: MediaFormat): Boolean {
         if (a.getString(MediaFormat.KEY_MIME) != b.getString(MediaFormat.KEY_MIME)) return false
+        // Container extensions may differ (MP4, MOV, MKV, WebM, etc.). For lossless
+        // stream-copy, require the same codec and core dimensions/audio layout, but allow
+        // variable frame rates and codec profile/level metadata to differ between clips.
         val keys = listOf(MediaFormat.KEY_WIDTH, MediaFormat.KEY_HEIGHT, MediaFormat.KEY_SAMPLE_RATE,
-            MediaFormat.KEY_CHANNEL_COUNT, MediaFormat.KEY_FRAME_RATE, MediaFormat.KEY_PROFILE, MediaFormat.KEY_LEVEL)
+            MediaFormat.KEY_CHANNEL_COUNT)
         return keys.all { key ->
             !a.containsKey(key) || !b.containsKey(key) || try { a.getInteger(key) == b.getInteger(key) } catch (_: Exception) { true }
         }
