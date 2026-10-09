@@ -6,8 +6,6 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.ContentValues
 import android.content.Intent
-import android.media.MediaExtractor
-import android.media.MediaFormat
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -115,27 +113,15 @@ private class Merger(private val context: android.content.Context) {
     suspend fun run(items: ArrayList<String>, progress: (Int, String) -> Unit) {
         require(items.size >= 2) { "Select at least two videos." }
 
-        // Verify every selected URI is readable as video before doing the expensive export.
+        // Check that each URI can be opened, but don't pre-parse with Android MediaExtractor:
+        // that would reject containers which Media3's own extractors can handle.
         val mediaItems = withContext(Dispatchers.IO) {
             items.mapIndexed { index, rawUri ->
                 progress((index * 3).coerceAtMost(12), "Checking video ${index + 1}/${items.size}…")
                 val uri = Uri.parse(rawUri)
-                val extractor = MediaExtractor()
-                try {
-                    extractor.setDataSource(context, uri, null)
-                    var hasVideo = false
-                    for (track in 0 until extractor.trackCount) {
-                        if (extractor.getTrackFormat(track).getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true) {
-                            hasVideo = true
-                            break
-                        }
-                    }
-                    require(hasVideo) {
-                        "File ${index + 1} has no readable video track. Choose a video file; WAV is audio-only."
-                    }
-                } finally {
-                    extractor.release()
-                }
+                val descriptor = context.contentResolver.openAssetFileDescriptor(uri, "r")
+                    ?: error("Video ${index + 1} cannot be opened. Re-select the file and try again.")
+                descriptor.use { }
                 EditedMediaItem.Builder(MediaItem.fromUri(uri)).build()
             }
         }
