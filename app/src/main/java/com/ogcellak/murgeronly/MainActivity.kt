@@ -182,7 +182,7 @@ class MainActivity : Activity() {
         list.removeAllViews()
         names.forEachIndexed { index, uri ->
             list.addView(TextView(this).apply {
-                text = "${index + 1}. ${uri.lastPathSegment?.substringAfterLast('/')?.takeLast(90) ?: "Video file"}"
+                text = "${index + 1}. ${Uri.parse(uri).lastPathSegment?.substringAfterLast('/')?.takeLast(90) ?: "Video file"}"
                 textSize = 13f; setTextColor(Color.rgb(211, 220, 237)); setPadding(dp(8), dp(8), dp(8), dp(8))
             })
         }
