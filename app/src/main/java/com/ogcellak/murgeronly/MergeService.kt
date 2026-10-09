@@ -88,11 +88,14 @@ private class Merger(private val context: Context) {
                 val af = if (audio >= 0) extractor.getTrackFormat(audio) else null
                 if (clips.isNotEmpty()) {
                     require(compatible(clips[0].videoFormat, vf)) {
-                        "Video ${index + 1} uses a different video format. Lossless merge needs matching codec, resolution and settings."
+                        "Video ${index + 1} is not compatible for lossless merging. " +
+                            "First: ${describe(clips[0].videoFormat)}; this clip: ${describe(vf)}. " +
+                            "No video was changed. Clips with different codecs or resolutions need conversion, which would re-encode."
                     }
                     val firstAudio = clips[0].audioFormat
                     require((firstAudio == null && af == null) || (firstAudio != null && af != null && compatible(firstAudio, af))) {
-                        "Video ${index + 1} uses a different audio format. No output was created."
+                        "Video ${index + 1} has incompatible audio tracks. " +
+                            "First: ${firstAudio?.let { describe(it) } ?: "no audio"}; this clip: ${af?.let { describe(it) } ?: "no audio"}. No output was created."
                     }
                 }
                 clips.add(Clip(item, video, audio, vf, af, duration(extractor, video),
@@ -188,6 +191,18 @@ private class Merger(private val context: Context) {
         val format = extractor.getTrackFormat(track)
         return if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION).coerceAtLeast(0L) else 0L
     }
+    private fun describe(format: MediaFormat): String {
+        val mime = format.getString(MediaFormat.KEY_MIME) ?: "unknown codec"
+        val size = if (mime.startsWith("video/")) {
+            "${format.integerOrNull(MediaFormat.KEY_WIDTH) ?: "?"}x${format.integerOrNull(MediaFormat.KEY_HEIGHT) ?: "?"}"
+        } else {
+            "${format.integerOrNull(MediaFormat.KEY_SAMPLE_RATE) ?: "?"} Hz / ${format.integerOrNull(MediaFormat.KEY_CHANNEL_COUNT) ?: "?"} channels"
+        }
+        return "$mime ($size)"
+    }
+    private fun MediaFormat.integerOrNull(key: String): Int? =
+        if (containsKey(key)) try { getInteger(key) } catch (_: Exception) { null } else null
+
     private fun compatible(a: MediaFormat, b: MediaFormat): Boolean {
         if (a.getString(MediaFormat.KEY_MIME) != b.getString(MediaFormat.KEY_MIME)) return false
         // Container extensions may differ (MP4, MOV, MKV, WebM, etc.). For lossless
