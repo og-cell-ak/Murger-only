@@ -42,11 +42,12 @@ class MainActivity : Activity() {
         else if (prefs.getInt("progress", 0) == 100) showProgress(100, prefs.getString("message", "Merge complete") ?: "Merge complete")
     }
 
+    @Suppress("DEPRECATION")
     override fun onStart() {
         super.onStart()
         val f = IntentFilter(MergeService.PROGRESS)
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(progressReceiver, f, RECEIVER_NOT_EXPORTED)
-        else @Suppress("DEPRECATION") registerReceiver(progressReceiver, f)
+        else registerReceiver(progressReceiver, f)
         receiverRegistered = true
     }
 
@@ -193,7 +194,7 @@ class MainActivity : Activity() {
     private fun showProgress(value: Int, message: String) {
         val p = value.coerceIn(0, 100)
         progressBar.progress = p
-        percent.text = "$" + "p%"
+        percent.text = "${p}%"
         status.text = message
         val prefs = getSharedPreferences("merge_state", MODE_PRIVATE)
         val start = prefs.getLong("started", 0L)
