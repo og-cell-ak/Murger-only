@@ -9,6 +9,7 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
+import android.provider.OpenableColumns
 import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
@@ -79,19 +80,19 @@ class MainActivity : Activity() {
             setTypeface(Typeface.DEFAULT, Typeface.BOLD)
         })
         headings.addView(TextView(this).apply {
-            text = "Join videos. Keep the original streams."
+            text = "Join MP4 videos. No re-encoding."
             textSize = 13f; setTextColor(Color.rgb(180, 197, 224)); setPadding(0, dp(4), 0, 0)
         })
         hero.addView(headings, LinearLayout.LayoutParams(0, -2, 1f))
         root.addView(hero)
 
         root.addView(TextView(this).apply {
-            text = "MIXED-FORMAT MP4 EXPORT"
+            text = "MP4 ONLY • LOSSLESS STREAM MERGE"
             textSize = 12f; setTypeface(Typeface.DEFAULT, Typeface.BOLD)
             setTextColor(Color.rgb(100, 211, 190)); setPadding(dp(2), dp(20), 0, dp(5))
         })
         root.addView(TextView(this).apply {
-            text = "Different supported video formats are converted to a common H.264/AAC MP4 before joining. Conversion can change quality slightly; keep enough free storage for the export."
+            text = "MP4 files only. Original compressed audio/video samples are copied without re-encoding, so picture and sound quality are not reduced by conversion. To preserve quality, clips must have matching codecs, dimensions, and audio settings. Incompatible MP4s show an error instead of being re-encoded."
             textSize = 14f; setTextColor(Color.rgb(211, 220, 237)); setPadding(dp(2), 0, dp(2), dp(14))
         })
 
@@ -156,7 +157,7 @@ class MainActivity : Activity() {
 
     private fun pick() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-            type = "video/*"
+            type = "video/mp4"
             putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
             addCategory(Intent.CATEGORY_OPENABLE)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
@@ -171,11 +172,28 @@ class MainActivity : Activity() {
         val selected = ArrayList<Uri>()
         data.clipData?.let { clip -> for (i in 0 until clip.itemCount) selected.add(clip.getItemAt(i).uri) }
             ?: data.data?.let { selected.add(it) }
-        for (uri in selected) if (!names.contains(uri.toString())) {
-            try { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) { }
-            names.add(uri.toString())
+        var skipped = 0
+        for (uri in selected) {
+            if (!isMp4Document(uri)) {
+                skipped++
+                continue
+            }
+            if (!names.contains(uri.toString())) {
+                try { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) { }
+                names.add(uri.toString())
+            }
         }
         refresh()
+        if (skipped > 0) Toast.makeText(this, "Only MP4 video files can be added.", Toast.LENGTH_LONG).show()
+    }
+
+    private fun isMp4Document(uri: Uri): Boolean {
+        val mime = contentResolver.getType(uri)?.substringBefore(';')?.trim()?.lowercase()
+        var displayName = uri.lastPathSegment ?: ""
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) displayName = cursor.getString(0) ?: displayName
+        }
+        return mime == "video/mp4" || displayName.lowercase().endsWith(".mp4")
     }
 
     private fun refresh() {
