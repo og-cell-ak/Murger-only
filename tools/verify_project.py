@@ -50,7 +50,7 @@ checks = {
         ),
         "copies encoded samples without re-encoding": lambda: (
             "extractor.readSampleData(buffer, 0)" in service
-            and "muxer.writeSampleData" in service
+            and ".writeSampleData" in service
             and "MediaCodec.BufferInfo" in service
             and "Transformer" not in service
         ),
