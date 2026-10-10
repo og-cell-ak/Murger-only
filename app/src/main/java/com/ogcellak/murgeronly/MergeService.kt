@@ -5,36 +5,27 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMuxer
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
-import android.os.Handler
 import android.os.IBinder
-import android.os.Looper
 import android.provider.MediaStore
 import androidx.core.app.NotificationCompat
-import androidx.media3.common.MediaItem
-import androidx.media3.common.MimeTypes
-import androidx.media3.transformer.Composition
-import androidx.media3.transformer.EditedMediaItem
-import androidx.media3.transformer.EditedMediaItemSequence
-import androidx.media3.transformer.ExportException
-import androidx.media3.transformer.ExportResult
-import androidx.media3.transformer.ProgressHolder
-import androidx.media3.transformer.Transformer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.File
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
 
 class MergeService : Service() {
     companion object {
@@ -56,13 +47,13 @@ class MergeService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == START) {
-            startForeground(NOTIFICATION_ID, notice("Checking video formats…", 0))
+            startForeground(NOTIFICATION_ID, notice("Checking MP4 files…", 0))
             val uris = intent.getStringArrayListExtra("uris") ?: arrayListOf()
             getSharedPreferences("merge_state", MODE_PRIVATE).edit()
                 .putBoolean("running", true)
                 .putInt("progress", 0)
                 .putLong("started", System.currentTimeMillis())
-                .putString("message", "Checking video formats…")
+                .putString("message", "Checking MP4 files…")
                 .apply()
 
             scope.launch {
@@ -109,44 +100,25 @@ class MergeService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 }
 
-private class Merger(private val context: android.content.Context) {
+private class Merger(private val context: Context) {
     suspend fun run(items: ArrayList<String>, progress: (Int, String) -> Unit) {
-        require(items.size >= 2) { "Select at least two videos." }
-
-        // Check that each URI can be opened, but don't pre-parse with Android MediaExtractor:
-        // that would reject containers which Media3's own extractors can handle.
-        val mediaItems = withContext(Dispatchers.IO) {
-            items.mapIndexed { index, rawUri ->
-                progress((index * 3).coerceAtMost(12), "Checking video ${index + 1}/${items.size}…")
-                val uri = Uri.parse(rawUri)
-                val descriptor = context.contentResolver.openAssetFileDescriptor(uri, "r")
-                    ?: error("Video ${index + 1} cannot be opened. Re-select the file and try again.")
-                descriptor.use { }
-                EditedMediaItem.Builder(MediaItem.fromUri(uri)).build()
-            }
-        }
-
-        // One sequential sequence yields one continuous video. Transformer normalizes input
-        // codecs/containers to H.264/AAC MP4 rather than relying on byte-for-byte stream copy.
-        val sequence = EditedMediaItemSequence.Builder(mediaItems).build()
-        val composition = Composition.Builder(sequence).build()
-
-        // Keep large intermediate exports outside the cache (which Android may purge).
+        require(items.size >= 2) { "Select at least two MP4 videos." }
+        val uris = items.map { Uri.parse(it) }
         val tempDirectory = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: context.cacheDir
         if (!tempDirectory.exists() && !tempDirectory.mkdirs()) error("Could not create temporary export storage.")
-        val temp = File(tempDirectory, "MergerOnly_${System.currentTimeMillis()}.mp4")
-        progress(3, "Preparing a common MP4 format…")
+        val temp = File(tempDirectory, "MergerOnly_" + System.currentTimeMillis() + ".mp4")
 
         try {
-            exportOnMainThread(composition, temp, progress)
-            require(temp.exists() && temp.isFile && temp.length() > 0L) {
-                "Conversion finished without a valid output file."
-            }
-
             withContext(Dispatchers.IO) {
-                progress(97, "Saving merged MP4…")
+                mergeWithoutReencoding(uris, temp, progress)
+            }
+            require(temp.exists() && temp.isFile && temp.length() > 0L) {
+                "Merge finished without a valid output file."
+            }
+            withContext(Dispatchers.IO) {
+                progress(97, "Saving merged MP4 without re-encoding…")
                 val values = ContentValues().apply {
-                    put(MediaStore.Video.Media.DISPLAY_NAME, "MergerOnly_${System.currentTimeMillis()}.mp4")
+                    put(MediaStore.Video.Media.DISPLAY_NAME, "MergerOnly_" + System.currentTimeMillis() + ".mp4")
                     put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
                     if (Build.VERSION.SDK_INT >= 29) {
                         put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Merger Only")
@@ -176,83 +148,186 @@ private class Merger(private val context: android.content.Context) {
                     }
                 }
             }
-            progress(100, "Merge complete. Saved in Movies/Merger Only")
+            progress(100, "Merge complete. Original audio/video streams preserved • Movies/Merger Only")
         } finally {
             try { temp.delete() } catch (_: Exception) { }
         }
     }
 
-    private suspend fun exportOnMainThread(
-        composition: Composition,
+    private fun mergeWithoutReencoding(
+        uris: List<Uri>,
         output: File,
         progress: (Int, String) -> Unit
     ) {
-        val mainHandler = Handler(Looper.getMainLooper())
-        var progressJob: Job? = null
-
+        val extractors = ArrayList<MediaExtractor>()
+        var muxer: MediaMuxer? = null
+        var muxerStarted = false
+        var muxerStopped = false
         try {
-            suspendCancellableCoroutine<Unit> { continuation ->
-                mainHandler.post {
-                    if (!continuation.isActive) return@post
+            val tracksPerClip = ArrayList<List<Int>>()
+            val formatsPerClip = ArrayList<List<MediaFormat>>()
 
-                    try {
-                        lateinit var transformer: Transformer
-                        transformer = Transformer.Builder(context)
-                            .setVideoMimeType(MimeTypes.VIDEO_H264)
-                            .setAudioMimeType(MimeTypes.AUDIO_AAC)
-                            .addListener(object : Transformer.Listener {
-                                override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                                    if (continuation.isActive) continuation.resume(Unit)
-                                }
+            uris.forEachIndexed { index, uri ->
+                progress((index * 8 / uris.size).coerceAtMost(12), "Checking MP4 " + (index + 1) + "/" + uris.size + "…")
+                require(hasMp4Signature(uri)) {
+                    "File " + (index + 1) + " is not a valid MP4 container. Select .mp4 files only."
+                }
+                val extractor = MediaExtractor()
+                try {
+                    extractor.setDataSource(context, uri, null)
+                } catch (t: Throwable) {
+                    extractor.release()
+                    error("Android could not read MP4 " + (index + 1) + ". The file may be damaged, protected, or use an unsupported codec.")
+                }
+                extractors.add(extractor)
 
-                                override fun onError(
-                                    composition: Composition,
-                                    exportResult: ExportResult,
-                                    exportException: ExportException
-                                ) {
-                                    if (continuation.isActive) {
-                                        continuation.resumeWithException(
-                                            IllegalStateException(
-                                                "Could not convert one of the selected videos: " +
-                                                    (exportException.message ?: "unsupported or damaged media")
-                                            )
-                                        )
-                                    }
-                                }
-                            })
-                            .build()
+                val selected = ArrayList<Int>()
+                for (trackIndex in 0 until extractor.trackCount) {
+                    val format = extractor.getTrackFormat(trackIndex)
+                    val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+                    if (mime.startsWith("video/") || mime.startsWith("audio/")) selected.add(trackIndex)
+                }
+                selected.sortWith(compareBy<Int> {
+                    val mime = extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME) ?: ""
+                    if (mime.startsWith("video/")) 0 else 1
+                }.thenBy { it })
 
-                        // Media3 Transformer is main-looper confined by default. Keep start and
-                        // progress polling on that looper while the service coroutine remains non-blocking.
-                        progressJob = CoroutineScope(Dispatchers.Main.immediate).launch {
-                            val holder = ProgressHolder()
-                            while (continuation.isActive) {
-                                try {
-                                    if (transformer.getProgress(holder) == Transformer.PROGRESS_STATE_AVAILABLE) {
-                                        progress(
-                                            (5 + holder.progress * 90 / 100).coerceIn(5, 95),
-                                            "Converting clips to MP4 • ${holder.progress}%"
-                                        )
-                                    }
-                                } catch (_: Exception) { }
-                                delay(500)
-                            }
-                        }
-                        continuation.invokeOnCancellation {
-                            mainHandler.post {
-                                progressJob?.cancel()
-                                try { transformer.cancel() } catch (_: Exception) { }
-                            }
-                        }
-                        transformer.start(composition, output.absolutePath)
-                    } catch (t: Throwable) {
-                        progressJob?.cancel()
-                        if (continuation.isActive) continuation.resumeWithException(t)
+                require(selected.any {
+                    (extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME) ?: "").startsWith("video/")
+                }) { "MP4 " + (index + 1) + " has no readable video track." }
+                selected.forEach { extractor.selectTrack(it) }
+                tracksPerClip.add(selected)
+                formatsPerClip.add(selected.map { extractor.getTrackFormat(it) })
+            }
+
+            val referenceTracks = tracksPerClip.first()
+            val referenceFormats = formatsPerClip.first()
+            for (clip in 1 until uris.size) {
+                require(tracksPerClip[clip].size == referenceTracks.size) {
+                    "MP4 " + (clip + 1) + " has a different number of audio/video tracks. To prevent quality loss, this app won't re-encode it."
+                }
+                for (i in referenceFormats.indices) {
+                    require(formatsMatch(referenceFormats[i], formatsPerClip[clip][i])) {
+                        val mime = referenceFormats[i].getString(MediaFormat.KEY_MIME) ?: "media"
+                        "MP4 " + (clip + 1) + " has a different " + mime + " format (codec, dimensions, or audio settings). Lossless merging requires matching track formats; no re-encoding was done."
                     }
                 }
             }
+
+            muxer = MediaMuxer(output.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val outputTrackForSelected = referenceFormats.mapIndexed { index, format ->
+                if (index == 0 && format.containsKey("rotation-degrees")) {
+                    val rotation = format.getInteger("rotation-degrees")
+                    if (rotation in listOf(0, 90, 180, 270)) muxer.setOrientationHint(rotation)
+                }
+                muxer.addTrack(format)
+            }
+            muxer.start()
+            muxerStarted = true
+
+            var timelineOffsetUs = 0L
+            extractors.forEachIndexed { clipIndex, extractor ->
+                progress((12 + clipIndex * 80 / uris.size).coerceAtMost(92),
+                    "Joining MP4 " + (clipIndex + 1) + "/" + uris.size + " without re-encoding…")
+                val selectedTracks = tracksPerClip[clipIndex]
+                val formats = formatsPerClip[clipIndex]
+                val sourceToOutput = HashMap<Int, Int>()
+                selectedTracks.forEachIndexed { selectedIndex, sourceIndex ->
+                    sourceToOutput[sourceIndex] = outputTrackForSelected[selectedIndex]
+                }
+
+                val buffers = HashMap<Int, ByteBuffer>()
+                selectedTracks.forEachIndexed { selectedIndex, sourceIndex ->
+                    val format = formats[selectedIndex]
+                    val hint = if (format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
+                        format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE).coerceAtLeast(0)
+                    } else 0
+                    val capacity = maxOf(4 * 1024 * 1024, hint).coerceAtMost(64 * 1024 * 1024)
+                    buffers[sourceIndex] = ByteBuffer.allocateDirect(capacity)
+                }
+
+                var maxPresentationTimeUs = 0L
+                while (true) {
+                    val sourceTrack = extractor.sampleTrackIndex
+                    if (sourceTrack < 0) break
+                    val buffer = buffers[sourceTrack]
+                    if (buffer != null) {
+                        buffer.clear()
+                        val sampleSize = extractor.readSampleData(buffer, 0)
+                        if (sampleSize < 0) break
+                        require(sampleSize <= buffer.capacity()) {
+                            "A sample in MP4 " + (clipIndex + 1) + " is too large for safe lossless copying."
+                        }
+                        val sourceTimeUs = extractor.sampleTime.coerceAtLeast(0L)
+                        maxPresentationTimeUs = maxOf(maxPresentationTimeUs, sourceTimeUs)
+                        val info = MediaMuxer.BufferInfo().apply {
+                            set(0, sampleSize, sourceTimeUs + timelineOffsetUs, extractor.sampleFlags)
+                        }
+                        buffer.position(0)
+                        buffer.limit(sampleSize)
+                        muxer.writeSampleData(sourceToOutput[sourceTrack]!!, buffer, info)
+                    }
+                    if (!extractor.advance()) break
+                }
+
+                val declaredDurationUs = formats.mapNotNull { format ->
+                    if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION) else null
+                }.maxOrNull() ?: 0L
+                timelineOffsetUs += maxOf(declaredDurationUs, maxPresentationTimeUs + 1L)
+            }
+            muxer.stop()
+            muxerStopped = true
         } finally {
-            progressJob?.cancel()
+            if (muxerStarted && !muxerStopped) {
+                try { muxer?.stop() } catch (_: Exception) { }
+            }
+            try { muxer?.release() } catch (_: Exception) { }
+            extractors.forEach { try { it.release() } catch (_: Exception) { } }
         }
+    }
+
+    private fun hasMp4Signature(uri: Uri): Boolean {
+        context.contentResolver.openInputStream(uri).use { input ->
+            requireNotNull(input) { "Could not open the selected file." }
+            val header = ByteArray(12)
+            var count = 0
+            while (count < header.size) {
+                val read = input.read(header, count, header.size - count)
+                if (read <= 0) break
+                count += read
+            }
+            return count >= 8 && String(header, 4, 4, StandardCharsets.US_ASCII) == "ftyp"
+        }
+    }
+
+    private fun formatsMatch(a: MediaFormat, b: MediaFormat): Boolean {
+        if (a.getString(MediaFormat.KEY_MIME) != b.getString(MediaFormat.KEY_MIME)) return false
+        val importantKeys = listOf(
+            MediaFormat.KEY_WIDTH, MediaFormat.KEY_HEIGHT,
+            MediaFormat.KEY_SAMPLE_RATE, MediaFormat.KEY_CHANNEL_COUNT,
+            MediaFormat.KEY_PROFILE, MediaFormat.KEY_LEVEL,
+            MediaFormat.KEY_AAC_PROFILE, "color-standard", "color-transfer",
+            "color-range", "rotation-degrees", "bit-depth", "pcm-encoding"
+        )
+        for (key in importantKeys) {
+            val hasA = a.containsKey(key)
+            val hasB = b.containsKey(key)
+            if (hasA != hasB) return false
+            if (hasA && runCatching { a.getInteger(key) != b.getInteger(key) }.getOrDefault(true)) return false
+        }
+        for (key in listOf("csd-0", "csd-1", "csd-2")) {
+            val left = bytesForFormat(a, key)
+            val right = bytesForFormat(b, key)
+            if (left == null && right == null) continue
+            if (left == null || right == null || !left.contentEquals(right)) return false
+        }
+        return true
+    }
+
+    private fun bytesForFormat(format: MediaFormat, key: String): ByteArray? {
+        if (!format.containsKey(key)) return null
+        val buffer = format.getByteBuffer(key) ?: return null
+        val copy = buffer.duplicate()
+        return ByteArray(copy.remaining()).also { copy.get(it) }
     }
 }
