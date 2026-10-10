@@ -219,11 +219,11 @@ private class Merger(private val context: Context) {
             val outputTrackForSelected = referenceFormats.mapIndexed { index, format ->
                 if (index == 0) {
                     val rotation = runCatching { format.getInteger("rotation-degrees") }.getOrNull() ?: 0
-                    if (rotation in listOf(0, 90, 180, 270)) muxer.setOrientationHint(rotation)
+                    if (rotation in listOf(0, 90, 180, 270)) muxer!!.setOrientationHint(rotation)
                 }
-                muxer.addTrack(format)
+                muxer!!.addTrack(format)
             }
-            muxer.start()
+            muxer!!.start()
             muxerStarted = true
 
             var timelineOffsetUs = 0L
@@ -264,7 +264,7 @@ private class Merger(private val context: Context) {
                         }
                         buffer.position(0)
                         buffer.limit(sampleSize)
-                        muxer.writeSampleData(sourceToOutput[sourceTrack]!!, buffer, info)
+                        muxer!!.writeSampleData(sourceToOutput[sourceTrack]!!, buffer, info)
                     }
                     if (!extractor.advance()) break
                 }
@@ -274,7 +274,7 @@ private class Merger(private val context: Context) {
                 }.maxOrNull() ?: 0L
                 timelineOffsetUs += maxOf(declaredDurationUs, maxPresentationTimeUs + 1L)
             }
-            muxer.stop()
+            muxer!!.stop()
             muxerStopped = true
         } finally {
             if (muxerStarted && !muxerStopped) {
