@@ -7,6 +7,7 @@ import android.app.Service
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
@@ -216,8 +217,8 @@ private class Merger(private val context: Context) {
 
             muxer = MediaMuxer(output.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
             val outputTrackForSelected = referenceFormats.mapIndexed { index, format ->
-                if (index == 0 && format.containsKey("rotation-degrees")) {
-                    val rotation = format.getInteger("rotation-degrees")
+                if (index == 0) {
+                    val rotation = runCatching { format.getInteger("rotation-degrees") }.getOrNull() ?: 0
                     if (rotation in listOf(0, 90, 180, 270)) muxer.setOrientationHint(rotation)
                 }
                 muxer.addTrack(format)
@@ -239,9 +240,7 @@ private class Merger(private val context: Context) {
                 val buffers = HashMap<Int, ByteBuffer>()
                 selectedTracks.forEachIndexed { selectedIndex, sourceIndex ->
                     val format = formats[selectedIndex]
-                    val hint = if (format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
-                        format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE).coerceAtLeast(0)
-                    } else 0
+                    val hint = runCatching { format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE).coerceAtLeast(0) }.getOrDefault(0)
                     val capacity = maxOf(4 * 1024 * 1024, hint).coerceAtMost(64 * 1024 * 1024)
                     buffers[sourceIndex] = ByteBuffer.allocateDirect(capacity)
                 }
@@ -260,7 +259,7 @@ private class Merger(private val context: Context) {
                         }
                         val sourceTimeUs = extractor.sampleTime.coerceAtLeast(0L)
                         maxPresentationTimeUs = maxOf(maxPresentationTimeUs, sourceTimeUs)
-                        val info = MediaMuxer.BufferInfo().apply {
+                        val info = MediaCodec.BufferInfo().apply {
                             set(0, sampleSize, sourceTimeUs + timelineOffsetUs, extractor.sampleFlags)
                         }
                         buffer.position(0)
@@ -271,7 +270,7 @@ private class Merger(private val context: Context) {
                 }
 
                 val declaredDurationUs = formats.mapNotNull { format ->
-                    if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION) else null
+                    runCatching { format.getLong(MediaFormat.KEY_DURATION) }.getOrNull()
                 }.maxOrNull() ?: 0L
                 timelineOffsetUs += maxOf(declaredDurationUs, maxPresentationTimeUs + 1L)
             }
@@ -310,10 +309,9 @@ private class Merger(private val context: Context) {
             "color-range", "rotation-degrees", "bit-depth", "pcm-encoding"
         )
         for (key in importantKeys) {
-            val hasA = a.containsKey(key)
-            val hasB = b.containsKey(key)
-            if (hasA != hasB) return false
-            if (hasA && runCatching { a.getInteger(key) != b.getInteger(key) }.getOrDefault(true)) return false
+            val valueA = runCatching { a.getInteger(key) }.getOrNull()
+            val valueB = runCatching { b.getInteger(key) }.getOrNull()
+            if (valueA != valueB) return false
         }
         for (key in listOf("csd-0", "csd-1", "csd-2")) {
             val left = bytesForFormat(a, key)
@@ -325,8 +323,7 @@ private class Merger(private val context: Context) {
     }
 
     private fun bytesForFormat(format: MediaFormat, key: String): ByteArray? {
-        if (!format.containsKey(key)) return null
-        val buffer = format.getByteBuffer(key) ?: return null
+        val buffer = runCatching { format.getByteBuffer(key) }.getOrNull() ?: return null
         val copy = buffer.duplicate()
         return ByteArray(copy.remaining()).also { copy.get(it) }
     }
