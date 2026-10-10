@@ -16,7 +16,7 @@ workflow = WORKFLOW_PATH.read_text()
 
 checks = {
     "structure": {
-        "required files exist": lambda: all((ROOT / p).is_file() for p in [
+        "required app and workflow files exist": lambda: all((ROOT / p).is_file() for p in [
             "settings.gradle.kts",
             "build.gradle.kts",
             "app/build.gradle.kts",
@@ -26,85 +26,97 @@ checks = {
             "app/src/main/res/drawable/ic_murger_launcher.xml",
             ".github/workflows/build.yml",
         ]),
-        "Media3 transformer dependencies declared": lambda: all(x in gradle for x in [
-            "androidx.media3:media3-transformer:1.5.1",
-            "androidx.media3:media3-common:1.5.1",
-        ]),
-        "release workflow builds and validates signed APK": lambda: all(x in workflow for x in [
+        "native Android media APIs are used without transcoding dependencies": lambda: (
+            "android.media.MediaExtractor" in service
+            and "android.media.MediaMuxer" in service
+            and "media3-transformer" not in gradle
+        ),
+        "release workflow builds, signs, verifies, and uploads APK": lambda: all(x in workflow for x in [
             "assembleRelease", "apksigner", "APK integrity verification", "upload-artifact@v4"
         ]),
     },
     "formats": {
-        "uses one sequential media sequence": lambda: (
-            "EditedMediaItemSequence.Builder(mediaItems)" in service
-            and "Composition.Builder(sequence).build()" in service
+        "picker is restricted to MP4 MIME type": lambda: 'type = "video/mp4"' in activity,
+        "runtime checks MP4 file signature": lambda: (
+            "hasMp4Signature" in service and '"ftyp"' in service
         ),
-        "normalizes video and audio codecs": lambda: (
-            "setVideoMimeType(MimeTypes.VIDEO_H264)" in service
-            and "setAudioMimeType(MimeTypes.AUDIO_AAC)" in service
+        "extracts input tracks directly from each document URI": lambda: (
+            "extractor.setDataSource(context, uri, null)" in service
+            and "MediaExtractor" in service
         ),
-        "no old stream-copy incompatibility rejection path": lambda: (
-            "MediaMuxer" not in service and "compatible(" not in service
-            and "Lossless merge needs matching codec" not in service
+        "writes a single MP4 with Android MediaMuxer": lambda: (
+            "MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4" in service
+            and "MediaMuxer(output.absolutePath" in service
         ),
-        "input references handled as content URIs": lambda: "MediaItem.fromUri(uri)" in service,
+        "copies encoded samples without re-encoding": lambda: (
+            "extractor.readSampleData(buffer, 0)" in service
+            and "muxer.writeSampleData" in service
+            and "MediaCodec.BufferInfo" in service
+            and "Transformer" not in service
+        ),
+        "preserves audio and video tracks": lambda: (
+            'mime.startsWith("video/") || mime.startsWith("audio/")' in service
+            and 'selected.any' in service
+        ),
+        "rejects incompatible streams instead of degrading them": lambda: (
+            "formatsMatch" in service
+            and "different number of audio/video tracks" in service
+            and "Lossless merging requires matching track formats" in service
+        ),
     },
     "thread": {
-        "Transformer starts on Android main looper": lambda: (
-            "Handler(Looper.getMainLooper())" in service
-            and "mainHandler.post" in service
-            and "transformer.start(composition, output.absolutePath)" in service
+        "merge work runs away from the UI thread": lambda: (
+            "CoroutineScope(SupervisorJob() + Dispatchers.IO)" in service
+            and "withContext(Dispatchers.IO)" in service
         ),
-        "progress is polled on the main dispatcher": lambda: (
-            "Dispatchers.Main.immediate" in service
-            and "transformer.getProgress(holder)" in service
-            and "Converting clips to MP4" in service
+        "foreground service and progress updates remain enabled": lambda: (
+            "startForeground(NOTIFICATION_ID" in service
+            and "sendBroadcast(Intent(PROGRESS)" in service
+            and "setProgress(100" in service
         ),
-        "cancel and exceptions handled": lambda: (
-            "continuation.invokeOnCancellation" in service
-            and "transformer.cancel()" in service
-            and "resumeWithException" in service
+        "errors and service cancellation are handled": lambda: (
+            "Merge failed:" in service and "scope.cancel()" in service
+            and "extractors.forEach" in service and "muxer?.release()" in service
         ),
     },
     "storage": {
-        "large temporary export uses app external files where available": lambda: "getExternalFilesDir(Environment.DIRECTORY_MOVIES)" in service,
-        "saves final output through MediaStore": lambda: (
-            "MediaStore.Video.Media.EXTERNAL_CONTENT_URI" in service
-            and "openOutputStream(output, \"w\")" in service
-            and "RELATIVE_PATH" in service
+        "uses app external movie storage for temporary output": lambda: (
+            "getExternalFilesDir(Environment.DIRECTORY_MOVIES)" in service
         ),
-        "cleans intermediate and failed output": lambda: (
+        "saves final result in Movies/Merger Only": lambda: (
+            "MediaStore.Video.Media.EXTERNAL_CONTENT_URI" in service
+            and "Movies/Merger Only" in service
+            and "openOutputStream(output, \"w\")" in service
+        ),
+        "cleans temporary files and incomplete media rows": lambda: (
             "temp.delete()" in service
             and "context.contentResolver.delete(output, null, null)" in service
         ),
-        "runs as a foreground service": lambda: (
-            "startForeground(NOTIFICATION_ID" in service
-            and "android:foregroundServiceType=\"dataSync\"" in manifest
-        ),
     },
     "ui": {
-        "labels conversions honestly": lambda: (
-            "MIXED-FORMAT MP4 EXPORT" in activity
-            and "H.264/AAC MP4" in activity
-            and "quality slightly" in activity
+        "explains original quality and no re-encoding": lambda: (
+            "LOSSLESS STREAM MERGE" in activity
+            and "without re-encoding" in activity
+            and "Incompatible MP4s show an error" in activity
         ),
-        "selects multiple video files": lambda: (
-            'type = "video/*"' in activity
-            and "Intent.EXTRA_ALLOW_MULTIPLE" in activity
+        "filters out non-MP4 documents on selection": lambda: (
+            "isMp4Document(uri)" in activity
+            and 'endsWith(".mp4")' in activity
+            and "Only MP4 video files can be added." in activity
         ),
-        "live progress and ETA remain": lambda: (
-            "ProgressBar" in activity
-            and "percent.text" in activity
-            and "formatTime" in activity
-            and "MergeService.PROGRESS" in activity
+        "supports multi-select and clear selection": lambda: (
+            "Intent.EXTRA_ALLOW_MULTIPLE" in activity
+            and "names.clear()" in activity
         ),
-        "retry enabled after failure/completion": lambda: (
-            'message.startsWith("Merge failed:")' in activity
+        "retains live progress, ETA, and retry after failure": lambda: (
+            "ProgressBar" in activity and "formatTime" in activity
+            and 'message.startsWith("Merge failed:")' in activity
             and "merge.isEnabled = names.size >= 2" in activity
         ),
-        "launcher icon and notification permission/service set": lambda: (
+        "launcher icon and foreground service permissions remain": lambda: (
             'android:icon="@drawable/ic_murger_launcher"' in manifest
             and "android.permission.FOREGROUND_SERVICE" in manifest
+            and 'android:foregroundServiceType="dataSync"' in manifest
         ),
     },
 }
